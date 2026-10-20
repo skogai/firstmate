@@ -2068,6 +2068,161 @@ fm_backend_herdr_container_ensure() {  # <cwd-for-a-fresh-workspace> [<launcher-
   printf '%s:%s\t%s' "$session" "$FM_BACKEND_HERDR_WS_ID" "$FM_BACKEND_HERDR_WS_SEEDED_TAB_ID"
 }
 
+# fm_backend_herdr_session_lock_acquire_bounded <session>: take the
+# named-session presentation lock with the bounded wait task cleanup uses
+# (50 attempts, 0.1s apart) and set FM_BACKEND_HERDR_SESSION_LOCK_PATH for the
+# caller's fm_lock_release. Must be called as a PLAIN STATEMENT: the lock
+# records the acquiring process, so a command-substitution subshell would leave
+# a dead owner behind. Returns 1 when the lock path cannot be resolved or the
+# lock stays busy.
+fm_backend_herdr_session_lock_acquire_bounded() {  # <session>
+  local session=$1 lock_path attempt=0
+  FM_BACKEND_HERDR_SESSION_LOCK_PATH=""
+  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
+    # shellcheck source=bin/fm-wake-lib.sh
+    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
+  fi
+  lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session") || return 1
+  while [ "$attempt" -lt 50 ]; do
+    if fm_lock_try_acquire "$lock_path"; then
+      FM_BACKEND_HERDR_SESSION_LOCK_PATH=$lock_path
+      return 0
+    fi
+    sleep 0.1
+    attempt=$((attempt + 1))
+  done
+  return 1
+}
+
+# --- persistent layout (docs/herdr-backend.md "Persistent layout") ----------
+#
+# A layout workspace is one this home declared in config/herdr-layout
+# (bin/fm-herdr-layout.sh owns the setting): a workspace in the selected named
+# session whose label is the declared name AND that holds this home's anchor
+# tab. The anchor tab is the workspace's own shell. It keeps the workspace
+# alive while task tabs come and go, because closing a workspace's last tab
+# removes the workspace (verified against the real binary), so ordinary task
+# cleanup - which closes only the task's own recorded pane - never removes a
+# layout workspace. The anchor is half of the identity on purpose: herdr
+# enforces no label uniqueness and reports an unlabeled workspace's label as
+# its cwd basename (verified on 0.9.5), so a declared name alone could adopt a
+# captain's own workspace, and the anchor label carries this home's label so
+# two homes declaring the same name never share a workspace. Neither label is
+# close, cleanup, or ownership authority: this code only creates a layout
+# workspace and places task tabs in it.
+
+# fm_backend_herdr_layout_anchor_label: this home's anchor tab label. It never
+# starts with "fm-", so no task-tab label scan mistakes it for a task.
+fm_backend_herdr_layout_anchor_label() {
+  printf 'layout·%s' "$(fm_backend_herdr_workspace_label)"
+}
+
+# fm_backend_herdr_layout_workspace_find <session> <name>: read-only. Sets
+# FM_BACKEND_HERDR_LAYOUT_WS_ID (and FM_BACKEND_HERDR_LAYOUT_MATCHES, the
+# space-separated matching ids). Must be called as a plain statement.
+# Returns 0 for exactly one layout workspace, 1 for none, 2 for more than one,
+# and 3 when a herdr read failed or was unparseable.
+fm_backend_herdr_layout_workspace_find() {  # <session> <name>
+  local session=$1 name=$2 anchor list ids id tabs anchors count=0
+  FM_BACKEND_HERDR_LAYOUT_WS_ID=""
+  FM_BACKEND_HERDR_LAYOUT_MATCHES=""
+  anchor=$(fm_backend_herdr_layout_anchor_label)
+  list=$(fm_backend_herdr_cli "$session" workspace list 2>/dev/null) || return 3
+  ids=$(printf '%s' "$list" | jq -r --arg want "$name" '
+    if (.result.workspaces | type) == "array"
+    then .result.workspaces[] | select(.label == $want) | .workspace_id
+    else error("missing result.workspaces") end
+  ' 2>/dev/null) || return 3
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    tabs=$(fm_backend_herdr_cli "$session" tab list --workspace "$id" 2>/dev/null) || return 3
+    anchors=$(printf '%s' "$tabs" | jq -r --arg anchor "$anchor" '
+      if (.result.tabs | type) == "array"
+      then [.result.tabs[] | select(.label == $anchor)] | length
+      else error("missing result.tabs") end
+    ' 2>/dev/null) || return 3
+    case "$anchors" in ''|*[!0-9]*) return 3 ;; 0) continue ;; esac
+    count=$((count + 1))
+    FM_BACKEND_HERDR_LAYOUT_WS_ID=$id
+    FM_BACKEND_HERDR_LAYOUT_MATCHES="${FM_BACKEND_HERDR_LAYOUT_MATCHES:+$FM_BACKEND_HERDR_LAYOUT_MATCHES }$id"
+  done <<EOF
+$ids
+EOF
+  [ "$count" -eq 1 ] && return 0
+  FM_BACKEND_HERDR_LAYOUT_WS_ID=""
+  [ "$count" -eq 0 ] && return 1
+  return 2
+}
+
+# fm_backend_herdr_layout_workspace_create <session> <name> <cwd>: create one
+# layout workspace and its anchor tab through the ordinary flat sequence -
+# workspace create, then fm_backend_herdr_create_task for the anchor, which
+# prunes only the seeded default tab this same create returned. The caller
+# holds the session lock. Focus is snapshotted first and restored if the
+# creation moved it; an empty session has no prior focus to keep.
+fm_backend_herdr_layout_workspace_create() {  # <session> <name> <cwd>
+  local session=$1 name=$2 cwd=$3 before out wsid seeded anchor rc=0
+  anchor=$(fm_backend_herdr_layout_anchor_label)
+  before=$(fm_backend_herdr_projection_focus_snapshot "$session") || before=
+  out=$(fm_backend_herdr_cli "$session" workspace create --cwd "$cwd" --label "$name" --no-focus 2>/dev/null) || {
+    echo "error: herdr could not create layout workspace '$name' in session '$session'" >&2
+    return 1
+  }
+  wsid=$(printf '%s' "$out" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null)
+  seeded=$(printf '%s' "$out" | jq -r '.result.tab.tab_id // empty' 2>/dev/null)
+  if [ -z "$wsid" ] || [ -z "$seeded" ]; then
+    echo "error: could not parse herdr workspace create output for layout workspace '$name' in session '$session'" >&2
+    return 1
+  fi
+  if ! fm_backend_herdr_create_task "$session:$wsid" "$anchor" "$cwd" "$seeded" >/dev/null; then
+    echo "error: herdr created layout workspace '$name' ($wsid) in session '$session' but not its '$anchor' anchor tab; close that workspace in Herdr before retrying" >&2
+    rc=1
+  fi
+  [ -z "$before" ] || fm_backend_herdr_projection_focus_restore "$session" "$before" "layout workspace create" || true
+  [ "$rc" -eq 0 ] || return 1
+  # shellcheck disable=SC2034 # Read by fm_backend_herdr_layout_workspace_ensure's callers.
+  FM_BACKEND_HERDR_LAYOUT_WS_ID=$wsid
+}
+
+# fm_backend_herdr_layout_workspace_ensure <session> <name> <cwd>: the layout
+# workspace for <name>, created in <cwd> when absent. Must be called as a plain
+# statement. Sets FM_BACKEND_HERDR_LAYOUT_WS_ID and
+# FM_BACKEND_HERDR_LAYOUT_CREATED (1 when this call created it). A present
+# workspace costs reads only; creation takes the named-session lock and
+# re-reads inside it, so concurrent spawns and `fm-herdr-layout.sh up` create
+# one workspace. The caller has already ensured the session's server.
+# Returns 0, or 1 with the reason on stderr; more than one match is refused
+# rather than guessed at.
+fm_backend_herdr_layout_workspace_ensure() {  # <session> <name> <cwd>
+  local session=$1 name=$2 cwd=$3 status lock_path
+  FM_BACKEND_HERDR_LAYOUT_CREATED=0
+  fm_backend_herdr_layout_workspace_find "$session" "$name" && status=0 || status=$?
+  if [ "$status" -eq 1 ]; then
+    if ! fm_backend_herdr_session_lock_acquire_bounded "$session"; then
+      echo "error: herdr layout workspace '$name' could not take the session lock for session '$session'" >&2
+      return 1
+    fi
+    lock_path=$FM_BACKEND_HERDR_SESSION_LOCK_PATH
+    fm_backend_herdr_layout_workspace_find "$session" "$name" && status=0 || status=$?
+    if [ "$status" -eq 1 ]; then
+      if fm_backend_herdr_layout_workspace_create "$session" "$name" "$cwd"; then
+        # shellcheck disable=SC2034 # Read by bin/fm-herdr-layout.sh after the call.
+        FM_BACKEND_HERDR_LAYOUT_CREATED=1
+        status=0
+      else
+        status=4
+      fi
+    fi
+    fm_lock_release "$lock_path" || true
+  fi
+  case "$status" in
+    0) return 0 ;;
+    2) echo "error: more than one herdr layout workspace in session '$session' matches '$name' ($FM_BACKEND_HERDR_LAYOUT_MATCHES); rename or close the extras" >&2 ;;
+    3) echo "error: could not read herdr layout workspace '$name' in session '$session'" >&2 ;;
+  esac
+  return 1
+}
+
 # fm_backend_herdr_pane_presence_state: classify one exact pane get response
 # as dead|present|unknown from its JSON body, never from process exit status.
 fm_backend_herdr_pane_presence_state() {  # <session> <pane_id>
@@ -3633,23 +3788,9 @@ fm_backend_herdr_kill_serialized() {  # <session> <pane>
 
 fm_backend_herdr_kill() {  # <target>
   fm_backend_herdr_target_ready "$1" || return 0
-  local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE
-  local lock_path attempt=0 lock_held=0
-  if ! declare -F fm_lock_try_acquire >/dev/null 2>&1; then
-    # shellcheck source=bin/fm-wake-lib.sh
-    . "$FM_BACKEND_HERDR_ROOT/bin/fm-wake-lib.sh"
-  fi
-  if lock_path=$(fm_backend_herdr_presentation_session_lock_path "$session"); then
-    while [ "$attempt" -lt 50 ]; do
-      if fm_lock_try_acquire "$lock_path"; then
-        lock_held=1
-        break
-      fi
-      sleep 0.1
-      attempt=$((attempt + 1))
-    done
-  fi
-  if [ "$lock_held" = 1 ]; then
+  local session=$FM_BACKEND_HERDR_SESSION pane=$FM_BACKEND_HERDR_PANE lock_path
+  if fm_backend_herdr_session_lock_acquire_bounded "$session"; then
+    lock_path=$FM_BACKEND_HERDR_SESSION_LOCK_PATH
     fm_backend_herdr_kill_serialized "$session" "$pane"
     fm_lock_release "$lock_path" || true
   else

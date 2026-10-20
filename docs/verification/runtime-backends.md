@@ -1597,6 +1597,53 @@ HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
 
 Observed guarantee: one exact home-local, journal-correlated, one-tab and one-pane childless idle shell was closed after restoration while the exact non-target focus and default fleet session remained unchanged, and a repeat run was a no-op.
 
+### Persistent layout
+
+The two Herdr behaviors the persistent layout's identity and survival rest on were measured on 2026-10-20 against Herdr 0.9.5 protocol 22 in a guarded lab session.
+An unlabeled workspace reports its directory name as its label, so a declared name alone cannot identify a layout workspace:
+
+```sh
+"$HERDR_LAB_HELPER" run "$LAB" workspace create --cwd /tmp/fm-presetup-probe/web --no-focus | jq -c '.result.workspace | {workspace_id,label}'
+```
+
+```text
+{"workspace_id":"w2","label":"web"}
+```
+
+A workspace whose task tab closes while another tab remains keeps that tab and stays up, which is what the anchor tab relies on:
+
+```sh
+"$HERDR_LAB_HELPER" run "$LAB" pane close w1:p2
+"$HERDR_LAB_HELPER" run "$LAB" tab list --workspace w1 | jq -c '.result.tabs[] | {tab_id,label}'
+"$HERDR_LAB_HELPER" run "$LAB" workspace get w1 | jq -c '.result.workspace | {workspace_id,label,tab_count}'
+```
+
+```text
+{"tab_id":"w1:t1","label":"layout"}
+{"workspace_id":"w1","label":"crew","tab_count":1}
+```
+
+The end-to-end suite ran the same day against the same release:
+
+```sh
+HERDR_LAB_HELPER=bin/fm-herdr-lab.sh \
+  tests/fm-herdr-layout-e2e.test.sh
+```
+
+```text
+ok - status reports declared workspaces missing and ignores a decoy that only shares the label
+ok - up creates each declared workspace with its anchor tab, without adopting the decoy or moving focus
+ok - up is idempotent
+ok - a matched task lands as a tab in its layout workspace instead of a projection
+ok - an unmatched task keeps the ordinary placement
+ok - task cleanup closes only the task tab and the layout workspace stays up
+ok - after a Herdr server restart, up finds the restored layout workspaces
+ok - a routed spawn re-creates a lost layout workspace
+ok - the layout outlives every task and never touches foreign workspaces
+```
+
+The restart case stops the lab server through the helper's guarded stop and starts it again through its guarded provision; Herdr restored both layout workspaces with their ids and anchor tabs.
+
 ### Workspace-removal focus safety
 
 The focus-flash regression ran on 2026-08-05 against both Herdr 0.7.5 protocol 17 and Herdr 0.8.0 protocol 19 on macOS aarch64, with the 0.7.5 run using the pinned upstream release binary first on `PATH`:

@@ -133,6 +133,10 @@
 #   outside herdr has no workspace to inherit and uses this home's own labeled
 #   workspace, which must then match exactly one. --secondmate is the deliberate
 #   exception: it stands up that secondmate home's own workspace.
+#   With an opt-in config/herdr-layout rule matching it, a clean fresh crewmate
+#   or scout instead becomes a tab in that declared persistent workspace
+#   (bin/fm-herdr-layout.sh place; docs/herdr-backend.md "Persistent layout");
+#   a placement failure warns and keeps the placement described here.
 #   Herdr additionally uses a presentation-only layout by default when the
 #   selected client and running server meet the Herdr 0.8.0 floor. The local
 #   config/herdr-presentation-spaces file can say off to disable it or on to
@@ -4274,7 +4278,31 @@ else
     fi
     HERDR_PRESENTATION_JOURNAL=$(fm_backend_herdr_projection_journal_path "$STATE" "$ID")
     HERDR_PROJECTED=0
-    if [ "$KIND" != secondmate ] && fm_backend_herdr_presentation_enabled "$CONFIG" "$STATE"; then
+    # Opt-in persistent layout (docs/herdr-backend.md "Persistent layout"): a
+    # clean fresh crewmate or scout whose rule matches becomes an ordinary task
+    # tab in its declared workspace instead of a projection or a tab beside the
+    # launcher. Off costs one file test, and any failure has already warned and
+    # keeps the ordinary path below.
+    HERDR_LAYOUT_PLACED=0
+    if [ "$KIND" != secondmate ] && [ -e "$CONFIG/herdr-layout" ] &&
+      [ ! -e "$STATE/$ID.meta" ] && [ ! -L "$STATE/$ID.meta" ] &&
+      [ ! -e "$HERDR_PRESENTATION_JOURNAL" ] && [ ! -L "$HERDR_PRESENTATION_JOURNAL" ]; then
+      HERDR_LAYOUT_CONTAINER=$(FM_HOME=$FM_HOME FM_STATE_OVERRIDE=$STATE FM_CONFIG_OVERRIDE=$CONFIG \
+        "$SCRIPT_DIR/fm-herdr-layout.sh" place "$ID" "$PROJ_ABS") || HERDR_LAYOUT_CONTAINER=
+      if [ -n "$HERDR_LAYOUT_CONTAINER" ]; then
+        # An empty seeded-tab argument never prunes, so the layout's anchor tab
+        # and every sibling task tab are untouched.
+        HERDR_TASK_IDS=$(fm_backend_herdr_create_task "$HERDR_LAYOUT_CONTAINER" "$W" "$PROJ_ABS" "") || exit 1
+        read -r HERDR_TAB_ID HERDR_PANE_ID <<EOF
+$HERDR_TASK_IDS
+EOF
+        HERDR_SES=${HERDR_LAYOUT_CONTAINER%%:*}
+        HERDR_WORKSPACE_ID=${HERDR_LAYOUT_CONTAINER#*:}
+        HERDR_LAYOUT_PLACED=1
+      fi
+    fi
+    if [ "$HERDR_LAYOUT_PLACED" -ne 1 ] && [ "$KIND" != secondmate ] &&
+      fm_backend_herdr_presentation_enabled "$CONFIG" "$STATE"; then
       HERDR_SES=$(fm_backend_herdr_session)
       HERDR_PARENT_LABEL=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_workspace_label)
       if [ -e "$HERDR_PRESENTATION_JOURNAL" ] || [ -L "$HERDR_PRESENTATION_JOURNAL" ]; then
@@ -4408,7 +4436,7 @@ else
         fi
       fi
     fi
-    if [ "$HERDR_PROJECTED" -ne 1 ]; then
+    if [ "$HERDR_PROJECTED" -ne 1 ] && [ "$HERDR_LAYOUT_PLACED" -ne 1 ]; then
       HERDR_CONTAINER_RAW=$(FM_HOME="$HERDR_LABEL_HOME" fm_backend_herdr_container_ensure "$PROJ_ABS" "$HERDR_LAUNCHER_RELATIONSHIP") || exit 1
       # fm_backend_herdr_container_ensure echoes "<session>:<workspace_id>\t<seeded_default_tab_id>"
       # (the second field empty when this call ADOPTED a pre-existing workspace

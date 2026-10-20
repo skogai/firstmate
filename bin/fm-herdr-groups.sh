@@ -85,112 +85,48 @@ task_ok() {
   [ "${#1}" -le 64 ]
 }
 
+# shellcheck source=bin/fm-herdr-rules-lib.sh
+. "$SCRIPT_DIR/fm-herdr-rules-lib.sh"
+
 # Parsed setting: GROUPS_MODE is off, on (one group per project), or rules.
-# Rules keep file order; RULE_GROUP[i] owns the space-separated
-# RULE_SELECTORS[i], and RULE_RANK[i] is the order in which that group name
-# first appears, so a group may span several lines.
+# bin/fm-herdr-rules-lib.sh owns the rule grammar and keeps the parsed rules in
+# file order.
 GROUPS_MODE=off
-RULE_GROUP=()
-RULE_SELECTORS=()
-RULE_RANK=()
 
 load_setting() {
-  local file="$CONFIG/$FM_HERDR_GROUPS_CONFIG" line trimmed lower group selectors selector rank i groups=0
-  local -a lines=() sels=()
+  local file="$CONFIG/$FM_HERDR_GROUPS_CONFIG" lower
   GROUPS_MODE=off
-  RULE_GROUP=()
-  RULE_SELECTORS=()
-  RULE_RANK=()
+  FM_HERDR_RULE_NAME=()
   [ -f "$file" ] || return 0
-  while IFS= read -r line || [ -n "$line" ]; do
-    trimmed=${line#"${line%%[![:space:]]*}"}
-    trimmed=${trimmed%"${trimmed##*[![:space:]]}"}
-    case "$trimmed" in ''|'#'*) continue ;; esac
-    lines+=("$trimmed")
-  done < "$file"
-  if [ "${#lines[@]}" -eq 0 ]; then
+  fm_herdr_rules_read "$file"
+  if [ "${#FM_HERDR_RULE_LINES[@]}" -eq 0 ]; then
     GROUPS_MODE=on
     return 0
   fi
-  if [ "${#lines[@]}" -eq 1 ]; then
-    lower=$(printf '%s' "${lines[0]}" | tr '[:upper:]' '[:lower:]')
+  if [ "${#FM_HERDR_RULE_LINES[@]}" -eq 1 ]; then
+    lower=$(printf '%s' "${FM_HERDR_RULE_LINES[0]}" | tr '[:upper:]' '[:lower:]')
     case "$lower" in
       off) return 0 ;;
       on) GROUPS_MODE=on; return 0 ;;
     esac
   fi
   GROUPS_MODE=rules
-  for line in "${lines[@]}"; do
-    read -r group selectors <<EOF
-$line
-EOF
-    case "$group" in
-      *[!A-Za-z0-9._+-]*|'')
-        warn "$file: ignoring rule with invalid group name \"$group\" (letters, digits, . _ + - only)"
-        continue
-        ;;
-    esac
-    if [ "${#group}" -gt 32 ]; then
-      warn "$file: ignoring rule for group \"$group\" (at most 32 characters)"
-      continue
-    fi
-    read -r -a sels <<EOF
-$selectors
-EOF
-    for selector in ${sels[@]+"${sels[@]}"}; do
-      case "$selector" in
-        'task:'?*|'repo:'?*|'*') ;;
-        *) warn "$file: group \"$group\": ignoring unknown selector \"$selector\" (task:<prefix>, repo:<name>, or *)" ;;
-      esac
-    done
-    rank=
-    i=0
-    while [ "$i" -lt "${#RULE_GROUP[@]}" ]; do
-      [ "${RULE_GROUP[i]}" = "$group" ] && { rank=${RULE_RANK[i]}; break; }
-      i=$((i + 1))
-    done
-    [ -n "$rank" ] || { groups=$((groups + 1)); rank=$groups; }
-    RULE_GROUP+=("$group")
-    RULE_SELECTORS+=("$selectors")
-    RULE_RANK+=("$rank")
-  done
+  fm_herdr_rules_parse "$file" group warn
 }
 
-# resolve_group <task> <project-path>: sets GROUP and RANK.
-# Task-id prefixes win over repository names, which win over "*", in that order
-# across all rules; within one selector kind the first matching line wins.
+# resolve_group <task> <project-path>: sets GROUP and RANK. An unmatched task,
+# or any task outside rules mode, is grouped by its project directory.
 resolve_group() {
-  local task=$1 project=${2%/} repo i selector kind
-  local -a sels=()
-  repo=${project##*/}
-  [ -n "$repo" ] || repo=unknown
-  GROUP=$repo
+  local project=${2%/}
+  GROUP=${project##*/}
+  [ -n "$GROUP" ] || GROUP=unknown
   RANK=0
   [ "$GROUPS_MODE" = rules ] || return 0
-  for kind in task repo any; do
-    i=0
-    while [ "$i" -lt "${#RULE_GROUP[@]}" ]; do
-      read -r -a sels <<EOF
-${RULE_SELECTORS[i]}
-EOF
-      for selector in ${sels[@]+"${sels[@]}"}; do
-        case "$kind:$selector" in
-          task:task:?*)
-            case "$task" in "${selector#task:}"|"${selector#task:}"-*) ;; *) continue ;; esac
-            ;;
-          repo:repo:?*)
-            [ "$repo" = "${selector#repo:}" ] || continue
-            ;;
-          'any:*') ;;
-          *) continue ;;
-        esac
-        GROUP=${RULE_GROUP[i]}
-        RANK=${RULE_RANK[i]}
-        return 0
-      done
-      i=$((i + 1))
-    done
-  done
+  if fm_herdr_rules_match "$1" "$2"; then
+    GROUP=$FM_HERDR_RULE_MATCH_NAME
+    RANK=$FM_HERDR_RULE_MATCH_RANK
+    return 0
+  fi
   RANK=$FM_HERDR_GROUPS_UNMATCHED_RANK
 }
 

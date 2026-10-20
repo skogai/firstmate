@@ -20,6 +20,7 @@ Herdr provides the terminal session while Treehouse continues to provide task wo
 | Where task tabs appear and how to watch them | [Watching and task containers](#watching-and-task-containers) |
 | The one-task workspaces, their setting, and their cleanup | [Presentation spaces](#presentation-spaces) |
 | Grouping tasks by project with status tags and a sorted agents list | [Project groups](#project-groups) |
+| Premade workspaces that stay up and receive matching tasks | [Persistent layout](#persistent-layout) |
 | Why a seeded default tab is or is not closed | [Default-tab prune safety](#default-tab-prune-safety) |
 | What task metadata records for a Herdr endpoint | [Endpoint metadata](#endpoint-metadata) |
 | How text and keys reach a worker and how delivery is confirmed | [Current transport behavior](#current-transport-behavior) and [Composer and injection safety](#composer-and-injection-safety) |
@@ -99,6 +100,7 @@ Removing or upgrading the shadowing client is the durable fix.
 
 The ordinary topology puts one task tab per endpoint in the exact workspace of the Firstmate or secondmate that launches it.
 When the launcher has no Herdr workspace to inherit, the adapter maintains one durable home-labeled workspace instead.
+An opt-in [persistent layout](#persistent-layout) places matching tasks in premade workspaces instead.
 
 | Home | Workspace label |
 | --- | --- |
@@ -610,6 +612,81 @@ The tags, the agents view, and the placement are covered by offline tests agains
 They were also exercised against a real Herdr 0.9.5 server (protocol 22) in a guarded lab session: after one watcher poll `herdr pane list` showed the `fm_*` tokens on each task pane, the agents list header read `projects` with tasks ordered by group and then status, a newly spawned projected task landed after the other tasks of its group with only that workspace moving and no focus change, and `fm-herdr-groups.sh clear` removed the tokens and the view.
 To repeat the check on a live session, turn the feature on, wait one watcher poll, and confirm the same four results.
 
+## Persistent layout
+
+A persistent layout is an opt-in set of named Herdr workspaces that exist before work is dispatched, receive this home's matching tasks, and stay up when those tasks end, the way premade tmux sessions would.
+It is off by default, and without the setting nothing in this page's other sections changes.
+
+### Declaring the layout
+
+The local gitignored `config/herdr-layout` file declares it.
+It is not inherited into secondmate homes, so each home declares its own.
+
+| File content | Result |
+| --- | --- |
+| Absent | Off. No Herdr call is made. |
+| `off` | Off, the same as absent. |
+| `on` alone | Off, with a warning, because it names no workspace. |
+| Rule lines | On, with one persistent workspace per declared name. |
+
+Rule lines use the [group rules](#group-rules) grammar and precedence, with a workspace name in place of the group name.
+A name declared with no selector is created by `up` but receives no task.
+The names `firstmate` and `2ndmate-<id>` belong to the homes' own workspaces and are ignored with a warning.
+
+Example, one catch-all crew workspace plus a dedicated web workspace:
+
+```text
+# config/herdr-layout
+crew     *
+web      task:web repo:storefront
+```
+
+### Standing it up
+
+`bin/fm-herdr-layout.sh up` creates every missing declared workspace in the selected named session, starting that session's server when it is not running, and reports each workspace as created or present.
+It is idempotent, so the same command re-creates the layout after a Herdr server restart lost it.
+A restart that restores the session keeps the workspaces, and `up` then reports them present.
+`bin/fm-herdr-layout.sh status` reports each declared workspace as present, missing, ambiguous, unreadable, or server-stopped without starting or creating anything.
+A routed spawn also creates its one matching workspace when it is missing, so the layout re-forms on demand.
+The script's header owns exact output and exit codes.
+
+### Layout workspace identity
+
+A layout workspace is a workspace in the selected named session whose label is the declared name and that holds this home's anchor tab, labeled `layout·<home label>`, for example `layout·firstmate`.
+The anchor tab is the workspace's own shell, opened in the home's directory.
+It keeps the workspace alive, because Herdr removes a workspace when its last tab closes.
+
+The label alone is never enough.
+Herdr enforces no label uniqueness and reports an unlabeled workspace's label as its directory name, so a personal workspace opened in a directory named like a declared workspace would otherwise be adopted.
+The home label in the anchor keeps two homes that declare the same name in separate workspaces.
+More than one matching workspace is ambiguous: `up` reports it as failed and a spawn uses its ordinary placement until the extras are renamed or closed.
+
+Creation runs under the same named-session lock as task cleanup and presentation, rechecks inside that lock, and restores focus if creation moved it.
+It reuses the ordinary sequence: create the labeled workspace, add the anchor tab, and prune only the seeded default tab that same create returned.
+
+### Placement and cleanup
+
+A clean fresh crewmate or scout whose task matches a rule becomes an ordinary `fm-<id>` tab in that layout workspace.
+For that task it replaces both the [presentation projection](#presentation-spaces) and the tab beside the launcher.
+These keep the ordinary placement:
+
+- A task no rule matches.
+- A secondmate launch.
+- A relaunch, which keeps its recorded endpoint, and the reclaim of a gone endpoint.
+- A task that already has a record or a presentation journal.
+
+Any failure to place a task, including ambiguity, an unreadable session, or a busy lock, warns and keeps the ordinary placement rather than failing the spawn.
+
+Task cleanup is unchanged: it closes only the task's own recorded pane, which never empties a workspace that still holds its anchor.
+So no Firstmate cleanup tears a layout workspace down.
+Closing the anchor tab in Herdr releases the workspace from the layout, and the next routed spawn or `up` creates a fresh one.
+
+### Layout tests
+
+`tests/fm-herdr-layout.test.sh` pins the setting, routing, identity, idempotence, ambiguity, and secondmate-home anchor against a scripted Herdr CLI.
+`tests/fm-herdr-layout-e2e.test.sh` drives `up`, spawn, cleanup, a guarded server restart, and on-demand re-creation against a real Herdr server in a guarded lab session.
+[`verification/runtime-backends.md`](verification/runtime-backends.md#persistent-layout) records the measured Herdr behavior the layout relies on.
+
 ## Default-tab prune safety
 
 `herdr workspace create` seeds one default tab.
@@ -956,6 +1033,7 @@ Tests use thin compatibility wrappers in `tests/herdr-test-safety.sh` and never 
 
 - Presentation ordering needs protocol 16 and Python and is best-effort only.
 - Project groups need protocol 22 and Python, are tested offline, and were checked live once against Herdr 0.9.5 on protocol 22.
+- The persistent layout is placement only: it never orders or rearranges workspaces, and a reclaimed endpoint uses the ordinary placement.
 - Mutable labels can collide; they are never placement or destructive authority.
 - A Firstmate outside Herdr cannot resolve a launcher workspace, so a colliding home label refuses new spawns until the collision is cleared.
 - Ghost and placeholder recognition uses ANSI de-emphasis when available; an unstyled glyph row carrying trailing non-idle text fails safely to `unknown`.
@@ -980,6 +1058,8 @@ tests/fm-control-herdr-smoke.test.sh
 tests/fm-herdr-session-cleanup.test.sh
 tests/fm-herdr-session-cleanup-e2e.test.sh
 tests/fm-herdr-groups.test.sh
+tests/fm-herdr-layout.test.sh
+tests/fm-herdr-layout-e2e.test.sh
 tests/fm-herdr-attached-viewer-live-e2e.test.sh
 tests/fm-afk-inject-herdr-e2e.test.sh
 tests/fm-afk-pi-herdr-return-e2e.test.sh
